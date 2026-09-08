@@ -1,0 +1,9 @@
+# Compiled object files and binaries
+*.o
+*.out
+exchange_server
+trader_client
+market_data_client
+
+# VS Code specific settings (your partner on Mac will have different SFTP settings)
+.vscode/

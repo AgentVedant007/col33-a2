@@ -1,0 +1,3 @@
+#!/bin/sh
+# Starts a Market-Data Client.
+exec "$(dirname "$0")/../bin/market_data_client" "$@"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Starts the Exchange Server.
+exec "$(dirname "$0")/../bin/exchange_server" "$@"

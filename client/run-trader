@@ -1,0 +1,3 @@
+#!/bin/sh
+# Starts a Trader Client.
+exec "$(dirname "$0")/../bin/trader_client" "$@"

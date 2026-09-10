@@ -1,30 +1,3 @@
-// conn_flood.cpp - client-generation program for the scalability bonus.
-//
-// It opens the requested number of TCP connections to the Exchange Server and
-// then holds them open without sending any application data, so that the
-// server's resource usage can be measured while N idle connections exist.
-//
-// Usage:
-//   ./conn_flood [options]
-//     --host <ip>      server address        (default 127.0.0.1)
-//     --port <port>    first server port     (default 5000)
-//     --ports <n>      spread the connections over n consecutive server ports
-//     --count <n>      how many connections to open (default 10000)
-//     --nofile <n>     descriptor limit to ask for (default count + 1000)
-//
-// About --ports: a TCP connection is identified by
-// (client ip, client port, server ip, server port). With one client address
-// and one server port, the only part that can vary is the client's ephemeral
-// port, so the client runs out at around 65,000 connections (fewer in
-// practice, because net.inet.ip.portrange is narrower than that). Spreading
-// the connections over several server ports multiplies the available space.
-// The server must be started with the same --ports value.
-//
-// Typical run for the bonus table:
-//   sysctl net.inet.ip.portrange.first=10000
-//   sysctl net.inet.ip.portrange.last=65535
-//   ./server/run-server 127.0.0.1 5000 --ports 4 -q --nofile 200000
-//   ./bin/conn_flood --port 5000 --ports 4 --count 70000
 
 #include "common.h"
 
@@ -78,7 +51,6 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    // One descriptor per connection, plus a few for stdin/stdout/stderr.
     long want = (nofile > 0) ? nofile : count + 1000;
     long limit = raise_fd_limit(want);
     printf("file descriptor limit: %ld (asked for %ld)\n", limit, want);
@@ -88,22 +60,18 @@ int main(int argc, char **argv) {
 
     std::vector<int> fds;
     fds.reserve((size_t)count);
-    std::map<int, long> failures; // errno -> how many times it happened
+    std::map<int, long> failures;
 
     printf("opening %ld connections to %s ports %d..%d\n", count, host, port,
            port + num_ports - 1);
 
     long opened = 0;
     for (long i = 0; i < count && !g_stop; i++) {
-        // Round-robin over the server ports so no single four-tuple space
-        // fills up before the others.
         int p = port + (int)(i % num_ports);
 
         int fd = connect_to_server(host, p);
         if (fd < 0) {
             failures[errno]++;
-            // Stop at the first failure: for the bonus table what matters is
-            // the number of connections that were actually established.
             printf("connection %ld failed: %s\n", i + 1, strerror(errno));
             break;
         }

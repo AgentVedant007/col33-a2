@@ -56,9 +56,6 @@ std::string escape(const std::string &s) {
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// sockets
-// ---------------------------------------------------------------------------
 
 static bool fill_addr(const char *ip, int port, struct sockaddr_in &addr) {
     memset(&addr, 0, sizeof(addr));
@@ -82,9 +79,6 @@ int make_listening_socket(const char *ip, int port) {
         return -1;
     }
 
-    // Lets the server restart immediately after being stopped, instead of
-    // failing with "Address already in use" while old connections sit in
-    // TIME_WAIT.
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
@@ -93,11 +87,6 @@ int make_listening_socket(const char *ip, int port) {
         close(fd);
         return -1;
     }
-    // The backlog is the queue of connections the kernel has completed but we
-    // have not accept()ed yet. It has to be generous: a client that opens
-    // thousands of connections in a tight loop can fill a small queue faster
-    // than we drain it, and the extra connections are then refused. FreeBSD
-    // caps this at kern.ipc.somaxconn.
     if (listen(fd, 1024) < 0) {
         perror("listen");
         close(fd);
@@ -117,8 +106,6 @@ int connect_to_server(const char *ip, int port) {
         return -1;
     }
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        // Keep errno safe: perror() and close() can both overwrite it, and the
-        // caller wants to know why the connection failed.
         int saved = errno;
         perror("connect");
         close(fd);
@@ -162,9 +149,6 @@ std::string peer_addr(int fd) {
     return addr_to_string(a);
 }
 
-// ---------------------------------------------------------------------------
-// file descriptor limit
-// ---------------------------------------------------------------------------
 
 long current_fd_limit() {
     struct rlimit rl;
@@ -182,7 +166,6 @@ long raise_fd_limit(long want) {
     if ((long)rl.rlim_cur >= want)
         return (long)rl.rlim_cur;
 
-    // The soft limit can be raised up to the hard limit without being root.
     rlim_t target = (rlim_t)want;
     if (rl.rlim_max != RLIM_INFINITY && target > rl.rlim_max)
         target = rl.rlim_max;
@@ -195,9 +178,6 @@ long raise_fd_limit(long want) {
     return (long)target;
 }
 
-// ---------------------------------------------------------------------------
-// protocol helpers
-// ---------------------------------------------------------------------------
 
 std::vector<std::string> split_words(const std::string &s) {
     std::vector<std::string> words;
@@ -210,7 +190,6 @@ std::vector<std::string> split_words(const std::string &s) {
             i++;
         if (i > start) {
             std::string w = s.substr(start, i - start);
-            // Tolerate senders that end lines with CRLF.
             if (!w.empty() && w[w.size() - 1] == '\r')
                 w.erase(w.size() - 1);
             if (!w.empty())
@@ -222,10 +201,9 @@ std::vector<std::string> split_words(const std::string &s) {
 
 bool parse_int(const std::string &s, long lo, long hi, long &out) {
     if (s.empty() || s.size() > 10)
-        return false; // "2147483647" is 10 digits, anything longer is too big
+        return false;
     long v = 0;
     for (size_t i = 0; i < s.size(); i++) {
-        // Only plain digits: this rejects "-5", "+5", "1.5", "1e3", "12a".
         if (s[i] < '0' || s[i] > '9')
             return false;
         v = v * 10 + (s[i] - '0');
@@ -245,9 +223,6 @@ bool extract_line(std::string &buf, std::string &line) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// shared client loop
-// ---------------------------------------------------------------------------
 
 static bool send_string(int fd, const std::string &s) {
     size_t sent = 0;
@@ -265,8 +240,6 @@ static bool send_string(int fd, const std::string &s) {
 }
 
 int run_client(const char *ip, int port, const std::vector<std::string> &startup) {
-    // A dead server must not kill us with SIGPIPE; we want send() to fail
-    // with an error we can print instead.
     signal(SIGPIPE, SIG_IGN);
 
     int fd = connect_to_server(ip, port);
@@ -284,8 +257,8 @@ int run_client(const char *ip, int port, const std::vector<std::string> &startup
         }
     }
 
-    std::string sock_buf;  // partial data from the server
-    std::string stdin_buf; // partial line typed by the user
+    std::string sock_buf;
+    std::string stdin_buf;
     bool stdin_open = true;
 
     for (;;) {
@@ -312,7 +285,6 @@ int run_client(const char *ip, int port, const std::vector<std::string> &startup
             break;
         }
 
-        // --- messages from the exchange ---
         if (fds[0].revents != 0) {
             char buf[4096];
             ssize_t n = recv(fd, buf, sizeof(buf), 0);
@@ -330,13 +302,11 @@ int run_client(const char *ip, int port, const std::vector<std::string> &startup
 
             std::string line;
             while (extract_line(sock_buf, line)) {
-                // Protocol messages go to stdout, diagnostics to stderr.
                 printf("%s\n", line.c_str());
                 fflush(stdout);
             }
         }
 
-        // --- commands typed on stdin ---
         if (nfds > 1 && fds[1].revents != 0) {
             char buf[1024];
             ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));

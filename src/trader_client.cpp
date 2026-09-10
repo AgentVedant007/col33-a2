@@ -1,20 +1,3 @@
-// trader_client.cpp - Trader Client.
-//
-// Usage:  ./trader_client [ip] [port] [username]
-//
-// If a username is given, LOGIN <username> is sent automatically. After that,
-// type commands one per line:
-//
-//     BUY JNST 100 238
-//     SELL JNST 50 238
-//     CANCEL 42
-//     QUIT
-//
-// Replies from the exchange (OK, ERROR, ORDER_ACCEPTED, ORDER_CANCELLED,
-// BOUGHT, SOLD) are printed as they arrive. BOUGHT and SOLD can turn up at any
-// time, long after the order was submitted, because the connection is
-// bidirectional and the server sends them when a matching order appears.
-
 #include "common.h"
 
 #include <cstdio>

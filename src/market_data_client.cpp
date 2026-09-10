@@ -1,13 +1,3 @@
-// market_data_client.cpp - Market-Data Client (read-only).
-//
-// Usage:  ./market_data_client [ip] [port] [instrument ...]
-//
-// Every instrument named on the command line is subscribed to automatically.
-// After subscribing the client does not have to ask for anything: the server
-// pushes a TRADE line whenever a trade in that instrument happens.
-//
-// SUBSCRIBE, UNSUBSCRIBE and QUIT can also be typed one per line.
-
 #include "common.h"
 
 #include <cstdio>

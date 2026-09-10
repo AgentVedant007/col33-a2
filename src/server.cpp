@@ -1,28 +1,3 @@
-// server.cpp - the Exchange Server.
-//
-// Usage:  ./exchange_server [ip] [port] [options]
-// Default: 127.0.0.1 5000   (this is how experiment.py starts it)
-//
-//   -q                 do not log anything (used for the 70,000 connection test)
-//   --ports <n>        also listen on port+1 ... port+n-1 (see the note below)
-//   --nofile <n>       ask the OS for n file descriptors instead of the default
-//
-// Design:
-//   * one process, one thread, no forking
-//   * every socket is non-blocking
-//   * one kqueue() watches the listening socket(s) and every client socket
-//
-// Why kqueue(): a blocking server can only wait on one socket at a time, so an
-// idle client that never finishes a message would freeze everybody else
-// (Experiment 4). kqueue() lets us wait on all sockets at once and it only
-// reports the ones that are actually ready, so the cost of a wakeup depends on
-// how many sockets are active, not on how many are connected. That is what
-// makes tens of thousands of mostly idle connections practical.
-//
-// Each client has an input buffer (bytes that are not yet a whole message) and
-// an output buffer (messages we could not send because the client is not
-// reading, see Experiment 7). Neither is ever allowed to block the main loop.
-
 #include "common.h"
 
 #include <cerrno>
@@ -38,16 +13,12 @@
 #include <unistd.h>
 #include <vector>
 
-// ---------------------------------------------------------------------------
-// constants from the protocol specification
-// ---------------------------------------------------------------------------
 
-static const long VALUE_MIN = 1; // quantity and price
+static const long VALUE_MIN = 1;
 static const long VALUE_MAX = 2147483647L;
 static const long ORDER_ID_MIN = 0;
 static const long ORDER_ID_MAX = 2147483647L;
 
-// The exchange supports exactly two instruments.
 static const int INST_JNST = 0;
 static const int INST_IMCT = 1;
 static const int NUM_INSTRUMENTS = 2;
@@ -56,7 +27,6 @@ static const char *instrument_name(int inst) {
     return inst == INST_JNST ? "JNST" : "IMCT";
 }
 
-// Returns -1 if the name is not one of the two instruments.
 static int parse_instrument(const std::string &s) {
     if (s == "JNST")
         return INST_JNST;
@@ -65,33 +35,26 @@ static int parse_instrument(const std::string &s) {
     return -1;
 }
 
-// A client tells us what it is by its first command: LOGIN makes it a trader,
-// SUBSCRIBE makes it a market-data client.
 static const int ROLE_UNKNOWN = 0;
 static const int ROLE_TRADER = 1;
 static const int ROLE_MARKET_DATA = 2;
 
-// A protocol message longer than this is rejected, so a client that never
-// sends '\n' cannot make us buffer for ever.
 static const size_t MAX_LINE = 1024;
 
-// ---------------------------------------------------------------------------
-// state
-// ---------------------------------------------------------------------------
 
 struct Client {
     int fd;
-    int id; // never reused, unlike fd
+    int id;
     int role;
     std::string username;
 
-    std::string inbuf;  // bytes received but not yet a complete message
-    std::string outbuf; // messages waiting to be sent
+    std::string inbuf;
+    std::string outbuf;
 
     bool subscribed[NUM_INSTRUMENTS];
-    bool watching_write; // is EVFILT_WRITE currently registered for this fd?
-    bool send_blocked;   // true while the client is not draining its socket
-    bool remove_me;      // cleaned up at the end of the current batch
+    bool watching_write;
+    bool send_blocked;
+    bool remove_me;
 };
 
 struct Order {
@@ -99,19 +62,16 @@ struct Order {
     bool is_buy;
     int instrument;
     long price;
-    long quantity; // quantity still unfilled
-    int owner_id;  // client id, not fd: the order outlives the connection
+    long quantity;
+    int owner_id;
 };
 
 static int g_kq = -1;
-// Clients are kept in a map keyed by client id. A map (rather than a plain
-// vector we scan) matters once there are tens of thousands of connections:
-// looking up the owner of an order stays cheap.
 static std::map<int, Client *> g_clients;
-static std::set<std::string> g_usernames;    // usernames currently in use
+static std::set<std::string> g_usernames;
 static std::set<Client *> g_subscribers[NUM_INSTRUMENTS];
-static std::vector<Client *> g_dead;         // freed at the end of the batch
-static std::vector<Order> g_book;            // only unfilled orders are kept
+static std::vector<Client *> g_dead;
+static std::vector<Order> g_book;
 static int g_next_order_id = 1;
 static int g_next_client_id = 1;
 static size_t g_live_clients = 0;
@@ -119,17 +79,11 @@ static size_t g_live_clients = 0;
 static Client *find_client_by_id(int id) {
     std::map<int, Client *>::iterator it = g_clients.find(id);
     if (it == g_clients.end() || it->second->remove_me)
-        return NULL; // the trader has disconnected
+        return NULL;
     return it->second;
 }
 
-// ---------------------------------------------------------------------------
-// kqueue helpers
-// ---------------------------------------------------------------------------
 
-// Register or remove interest in one event for one socket. udata is the
-// Client* so that kevent() hands the client straight back to us and we never
-// have to search for it.
 static void kq_set(int fd, int filter, int flags, void *udata) {
     struct kevent change;
     EV_SET(&change, fd, filter, flags, 0, 0, udata);
@@ -137,8 +91,6 @@ static void kq_set(int fd, int filter, int flags, void *udata) {
         logf("kevent() change failed for fd %d: %s", fd, strerror(errno));
 }
 
-// We only ask about writability while there is something to write; otherwise
-// kqueue would report the socket ready over and over.
 static void want_write(Client *c, bool on) {
     if (on == c->watching_write)
         return;
@@ -146,13 +98,7 @@ static void want_write(Client *c, bool on) {
     c->watching_write = on;
 }
 
-// ---------------------------------------------------------------------------
-// sending
-// ---------------------------------------------------------------------------
 
-// Try to push a client's output buffer into the kernel. Whatever the socket
-// refuses stays in the buffer and is retried when kqueue reports the socket
-// writable. This is what keeps one slow reader from stalling the server.
 static void flush_output(Client *c) {
     while (!c->outbuf.empty()) {
         ssize_t n = send(c->fd, c->outbuf.data(), c->outbuf.size(), 0);
@@ -163,9 +109,6 @@ static void flush_output(Client *c) {
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // The client is not reading, so its socket buffer is full. Keep
-            // the data and wait for kqueue to say the socket is writable.
-            // Logged once per stall so the output stays readable.
             if (!c->send_blocked) {
                 c->send_blocked = true;
                 logf("client %d: send() would block, %zu bytes are now queued "
@@ -175,7 +118,6 @@ static void flush_output(Client *c) {
             want_write(c, true);
             return;
         }
-        // EPIPE / ECONNRESET: the client is gone.
         logf("client %d: send() failed (%s), dropping the connection", c->id,
              strerror(errno));
         c->remove_me = true;
@@ -198,15 +140,11 @@ static void send_line(Client *c, const std::string &msg) {
     flush_output(c);
 }
 
-// Sends TRADE to every market-data client subscribed to this instrument.
-// The same message goes to many clients: one-to-many communication.
 static void broadcast_trade(int instrument, long quantity, long price) {
     char msg[128];
     snprintf(msg, sizeof(msg), "TRADE %s %ld %ld", instrument_name(instrument),
              quantity, price);
 
-    // Copy first: send_line() can mark a client dead, and we must not modify
-    // the set while walking it.
     std::vector<Client *> targets(g_subscribers[instrument].begin(),
                                   g_subscribers[instrument].end());
     for (size_t i = 0; i < targets.size(); i++) {
@@ -215,24 +153,17 @@ static void broadcast_trade(int instrument, long quantity, long price) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// order handling
-// ---------------------------------------------------------------------------
 
-// Two orders match only if: same instrument, opposite sides, identical price.
-// The traded quantity is the smaller of the two remaining quantities.
 static void submit_order(Client *c, bool is_buy, int instrument, long quantity,
                          long price) {
     int order_id = g_next_order_id++;
 
-    // The order is accepted first; it may or may not execute afterwards.
     char accepted[64];
     snprintf(accepted, sizeof(accepted), "ORDER_ACCEPTED %d", order_id);
     send_line(c, accepted);
 
     long remaining = quantity;
 
-    // Oldest resting order first.
     size_t i = 0;
     while (i < g_book.size() && remaining > 0) {
         Order &o = g_book[i];
@@ -254,8 +185,6 @@ static void submit_order(Client *c, bool is_buy, int instrument, long quantity,
         snprintf(sold, sizeof(sold), "SOLD %s %ld %ld",
                  instrument_name(instrument), traded, price);
 
-        // The other side may have disconnected. Its order still trades; we
-        // simply have nobody to notify.
         Client *other = find_client_by_id(other_owner);
         if (is_buy) {
             send_line(c, bought);
@@ -271,12 +200,11 @@ static void submit_order(Client *c, bool is_buy, int instrument, long quantity,
         broadcast_trade(instrument, traded, price);
 
         if (filled)
-            g_book.erase(g_book.begin() + i); // fully executed
+            g_book.erase(g_book.begin() + i);
         else
             i++;
     }
 
-    // Anything left over rests in the book and may match a future order.
     if (remaining > 0) {
         Order o;
         o.id = order_id;
@@ -304,17 +232,12 @@ static void cancel_order(Client *c, long order_id) {
         return;
     }
 
-    // Not in the book: either it never existed, or it is already fully
-    // executed or cancelled (only outstanding orders can be cancelled).
     if (order_id < g_next_order_id)
         send_line(c, "ERROR order_not_outstanding");
     else
         send_line(c, "ERROR unknown_order");
 }
 
-// ---------------------------------------------------------------------------
-// one complete application message
-// ---------------------------------------------------------------------------
 
 static void handle_message(Client *c, const std::string &line) {
     std::vector<std::string> w = split_words(line);
@@ -324,7 +247,6 @@ static void handle_message(Client *c, const std::string &line) {
     }
     const std::string &cmd = w[0];
 
-    // ---- LOGIN <username> ----
     if (cmd == "LOGIN") {
         if (c->role == ROLE_MARKET_DATA) {
             send_line(c, "ERROR not_allowed_for_market_data_client");
@@ -350,7 +272,6 @@ static void handle_message(Client *c, const std::string &line) {
         return;
     }
 
-    // ---- BUY / SELL <instrument> <quantity> <price> ----
     if (cmd == "BUY" || cmd == "SELL") {
         if (c->role == ROLE_MARKET_DATA) {
             send_line(c, "ERROR not_allowed_for_market_data_client");
@@ -382,7 +303,6 @@ static void handle_message(Client *c, const std::string &line) {
         return;
     }
 
-    // ---- CANCEL <order_id> ----
     if (cmd == "CANCEL") {
         if (c->role == ROLE_MARKET_DATA) {
             send_line(c, "ERROR not_allowed_for_market_data_client");
@@ -405,7 +325,6 @@ static void handle_message(Client *c, const std::string &line) {
         return;
     }
 
-    // ---- SUBSCRIBE / UNSUBSCRIBE <instrument> ----
     if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE") {
         if (c->role == ROLE_TRADER) {
             send_line(c, "ERROR not_allowed_for_trader_client");
@@ -440,12 +359,9 @@ static void handle_message(Client *c, const std::string &line) {
         return;
     }
 
-    // ---- QUIT ----
     if (cmd == "QUIT") {
         logf("client %d sent QUIT, closing its connection", c->id);
         flush_output(c);
-        // Send our FIN so the client sees an orderly shutdown rather than a
-        // connection that simply vanishes.
         shutdown(c->fd, SHUT_WR);
         c->remove_me = true;
         return;
@@ -454,16 +370,12 @@ static void handle_message(Client *c, const std::string &line) {
     send_line(c, "ERROR unknown_command");
 }
 
-// ---------------------------------------------------------------------------
-// reading from a client
-// ---------------------------------------------------------------------------
 
 static void handle_readable(Client *c) {
     char buf[4096];
     ssize_t n = recv(c->fd, buf, sizeof(buf), 0);
 
     if (n == 0) {
-        // The client sent FIN: an orderly close.
         logf("client %d: recv() returned 0, the client closed its end (FIN)",
              c->id);
         c->remove_me = true;
@@ -473,7 +385,6 @@ static void handle_readable(Client *c) {
         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
             return;
         if (errno == ECONNRESET) {
-            // The client vanished without an orderly shutdown (RST).
             logf("client %d: recv() failed with ECONNRESET, the connection was "
                  "reset by the peer (RST)",
                  c->id);
@@ -484,8 +395,6 @@ static void handle_readable(Client *c) {
         return;
     }
 
-    // TCP gives us a byte stream, not messages. What arrives here may be part
-    // of a message, exactly one message, or several messages at once.
     logf("client %d: recv() returned %zd bytes: \"%s\"", c->id, n,
          escape(std::string(buf, (size_t)n)).c_str());
 
@@ -510,13 +419,8 @@ static void handle_readable(Client *c) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// accepting and removing clients
-// ---------------------------------------------------------------------------
 
 static void accept_new_clients(int listen_fd) {
-    // The listening socket is non-blocking, so we accept until there is
-    // nothing left rather than assuming exactly one connection is waiting.
     for (;;) {
         int fd = accept(listen_fd, NULL, NULL);
         if (fd < 0) {
@@ -525,8 +429,6 @@ static void accept_new_clients(int listen_fd) {
             if (errno == EINTR || errno == ECONNABORTED)
                 continue;
             if (errno == EMFILE || errno == ENFILE) {
-                // Out of file descriptors. Pause briefly instead of spinning
-                // on a listening socket that stays readable.
                 logf("accept() failed: %s (%zu clients connected). Raise the "
                      "descriptor limit with --nofile.",
                      strerror(errno), g_live_clients);
@@ -552,7 +454,6 @@ static void accept_new_clients(int listen_fd) {
         g_clients[c->id] = c;
         g_live_clients++;
 
-        // From now on kqueue tells us when this socket has data to read.
         kq_set(fd, EVFILT_READ, EV_ADD, c);
 
         logf("accepted client %d: connected socket fd %d, server side %s, "
@@ -562,8 +463,6 @@ static void accept_new_clients(int listen_fd) {
 }
 
 static void remove_finished_clients() {
-    // Collect first, delete after: an event we are still holding from this
-    // batch may point at a client that has just been marked dead.
     for (std::map<int, Client *>::iterator it = g_clients.begin();
          it != g_clients.end();) {
         Client *c = it->second;
@@ -584,16 +483,12 @@ static void remove_finished_clients() {
         g_live_clients--;
         logf("closing client %d (fd %d); %zu client(s) still connected", c->id,
              c->fd, g_live_clients);
-        // close() also removes every event registered for this descriptor.
         close(c->fd);
         delete c;
     }
     g_dead.clear();
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
 
 int main(int argc, char **argv) {
     const char *ip = "127.0.0.1";
@@ -628,8 +523,6 @@ int main(int argc, char **argv) {
     if (num_ports < 1)
         num_ports = 1;
 
-    // Writing to a socket whose client has disappeared must give us an error
-    // to handle, not kill the server.
     signal(SIGPIPE, SIG_IGN);
 
     if (nofile > 0)
@@ -643,18 +536,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // Normally one listening socket. Several are only needed for the 70,000
-    // connection test: a connection is identified by the four-tuple
-    // (client ip, client port, server ip, server port), so with one client
-    // address and one server port the client runs out of ephemeral ports at
-    // roughly 65,000. Extra server ports give it more room.
     std::vector<int> listen_fds;
     for (int i = 0; i < num_ports; i++) {
         int fd = make_listening_socket(ip, port + i);
         if (fd < 0)
             return 1;
         set_nonblocking(fd);
-        // udata == NULL marks a listening socket.
         kq_set(fd, EVFILT_READ, EV_ADD, NULL);
         listen_fds.push_back(fd);
         logf("exchange server listening on %s (listening socket fd %d)",
@@ -680,7 +567,7 @@ int main(int argc, char **argv) {
 
             Client *c = (Client *)events[i].udata;
             if (c->remove_me)
-                continue; // already finished earlier in this same batch
+                continue;
 
             if (events[i].filter == EVFILT_WRITE)
                 flush_output(c);
